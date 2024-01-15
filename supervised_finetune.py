@@ -5,10 +5,15 @@
 import os
 import sys
 from typing import List
-
+import json
 import fire
 import torch
 import transformers
+from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import AutoTokenizer
+
+from data_loader import sft_dataloader
+from datasets import Dataset, DatasetDict
 
 """
 Unused imports:
@@ -23,18 +28,38 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
-from transformers import LlamaForCausalLM, LlamaTokenizer
 
-from data_loader import sft_dataloader
+def read_jsonl(file_path):
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            data.append(json.loads(line))
+    return data
+
+# Read the JSONL files
+
+
+
+def convert_to_dataset_format(data):
+    dataset_dict = {}
+    # Initialize the dictionary with empty lists for each key
+    for key in data[0].keys():
+        dataset_dict[key] = []
+    # Aggregate the values for each key
+    for item in data:
+        for key, value in item.items():
+            dataset_dict[key].append(value)
+    return dataset_dict
+
 
 
 def train(
     # model/data params
-    base_model: str = "",  # the only required argument
-    data_path: str = "yahma/alpaca-cleaned",
-    output_dir: str = "./lora-alpaca",
+    base_model: str = "kfkas/Llama-2-ko-7b-Chat",  # the only required argument
+    data_path: str = "datasets",
+    output_dir: str = '/home/workspace/hdd/alphaca/supervised-finetuning',
     # training hyperparams
-    batch_size: int = 128,
+    batch_size: int = 256,
     micro_batch_size: int = 4,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
@@ -53,8 +78,8 @@ def train(
     add_eos_token: bool = False,
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
     # wandb params
-    wandb_project: str = "",
-    wandb_run_name: str = "",
+    wandb_project: str = "LLM",
+    wandb_run_name: str = "Supervised_Finetuning",
     wandb_watch: str = "",  # options: false | gradients | all
     wandb_log_model: str = "",  # options: false | true
     # either training checkpoint or final adapter
@@ -62,6 +87,21 @@ def train(
     # The prompt template to use, will default to alpaca.
     prompt_template_name: str = "alpaca",
 ):
+    train_data = read_jsonl('datasets/train_sft.jsonl')
+    valid_data = read_jsonl('datasets/validate_sft.jsonl')
+
+    train_dataset_dict = convert_to_dataset_format(train_data)
+    valid_dataset_dict = convert_to_dataset_format(valid_data)
+
+
+    train_dataset = Dataset.from_dict(train_dataset_dict)
+
+    valid_dataset = Dataset.from_dict(valid_dataset_dict)
+
+    combined_dataset = DatasetDict({
+        'train': train_dataset,
+        'test': valid_dataset
+    })
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
             f"Training Alpaca-LoRA model with params:\n"
@@ -95,6 +135,7 @@ def train(
     device_map = "auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
+    print(f"DDP:{ddp}")
     if ddp:
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
@@ -118,7 +159,7 @@ def train(
         device_map=device_map,
     )
 
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
     tokenizer.pad_token_id = (
         0  # unk. we want this to be different from the eos token
@@ -163,8 +204,8 @@ def train(
     # Be more transparent about the % of trainable params.
     model.print_trainable_parameters()
 
-    data_loader = sft_dataloader.SFTDataLoader(
-        data_path, cutoff_len, val_set_size, train_on_inputs, add_eos_token, prompt_template_name, tokenizer)
+    data_loader = sft_dataloader.CustomDataLoader(
+        combined_dataset, cutoff_len, val_set_size, train_on_inputs, add_eos_token, prompt_template_name, tokenizer)
     train_data, val_data = data_loader.load_data()
 
     if not ddp and torch.cuda.device_count() > 1:
@@ -225,4 +266,6 @@ def train(
 
 
 if __name__ == "__main__":
-    fire.Fire(train)
+    os.environ["CUDA_VISIBLE_DEVICES"]= "3"
+    print(torch.cuda.is_available())
+    #fire.Fire(train)

@@ -1,0 +1,4 @@
+name: alphaca
+channels:
+  - defaults
+prefix: /home/hyunseung/.conda/envs/alphaca

@@ -15,11 +15,10 @@ from datasets import load_dataset
 from utils.prompter import Prompter
 
 
-class SFTDataLoader(object):
-    def __init__(self, data_path, cutoff_len, val_set_size, train_on_inputs, add_eos_token, prompt_template_name, tokenizer) -> None:
-        super(SFTDataLoader, self).__init__()
-
-        self.data_path = data_path
+class CustomDataLoader(object):
+    def __init__(self, ds, cutoff_len, val_set_size, train_on_inputs, add_eos_token, prompt_template_name, tokenizer) -> None:
+        super(CustomDataLoader, self).__init__()
+        self.ds = ds
         self.cutoff_len = cutoff_len
         self.val_set_size = val_set_size
         self.train_on_inputs = train_on_inputs
@@ -77,29 +76,14 @@ class SFTDataLoader(object):
         return tokenized_full_prompt
 
     def load_data(self):
-        if self.data_path.endswith(".json") or self.data_path.endswith(".jsonl"):
-            data = load_dataset("json", data_files=self.data_path)
-        else:
-            data = load_dataset(self.data_path)
 
-        if self.val_set_size > 0:
-            train_val = data["train"].train_test_split(
-                test_size=self.val_set_size, shuffle=True, seed=42
-            )
-            train_data = (
-                train_val["train"].shuffle().map(
-                    self.generate_and_tokenize_prompt)
-            )
-            val_data = (
-                train_val["test"].shuffle().map(
-                    self.generate_and_tokenize_prompt)
-            )
-            train_data = train_data.select(range(1000))
-            val_data = val_data.select(range(100))
-        else:
-            train_data = data["train"].shuffle().map(
+        train_data = (
+            self.ds["train"].shuffle().map(
                 self.generate_and_tokenize_prompt)
-            val_data = None
-            train_data = train_data.select(range(1000))
-
+        )
+        val_data = (
+            self.ds["test"].shuffle().map(
+                self.generate_and_tokenize_prompt)
+        )
+      
         return train_data, val_data

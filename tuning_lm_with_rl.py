@@ -109,31 +109,24 @@ sent_kwargs = {"return_all_scores": True, "function_to_apply": "none", "batch_si
 # GPT-2 tokenizer has a pad token, but it is not eos_token by default. We need to set it to eos_token.
 # only for this model.
 
-if "llama" in script_args.tokenizer_name:
-    tokenizer = LlamaTokenizer.from_pretrained(script_args.tokenizer_name)
-else:
-    tokenizer = AutoTokenizer.from_pretrained(script_args.tokenizer_name)
-
-
-
-if "llama" in script_args.tokenizer_name:
-    tokenizer.add_special_tokens(
+from transformers import AutoTokenizer
+base_model = "kfkas/Llama-2-ko-7b-Chat"
+tokenizer = AutoTokenizer.from_pretrained(base_model)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.add_special_tokens(
         {
             "eos_token": DEFAULT_EOS_TOKEN,
             "bos_token": DEFAULT_BOS_TOKEN,
             "unk_token": DEFAULT_UNK_TOKEN,
             "pad_token": DEFAULT_PAD_TOKEN,
-        }
-    )
-else:
-    tokenizer.pad_token = tokenizer.eos_token
+        })
 
 
 # Below is an example function to build the dataset. In our case, we use the IMDB dataset
 # from the `datasets` library. One should customize this function to train the model on
 # its own dataset.
 def build_dataset(
-    tokenizer, dataset_name="lvwerra/stack-exchange-paired", input_min_text_length=2, input_max_text_length=8
+    tokenizer, dataset_name="datasets", input_min_text_length=2, input_max_text_length=8
 ):
     """
     Build dataset for training. This builds the dataset from `load_dataset`, one should

@@ -3,309 +3,267 @@
 # @author: Kun
 
 import os
-
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
-
-import evaluate
-import numpy as np
+import sys
+from typing import List
+import json
+import fire
 import torch
+import transformers
+from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import AutoTokenizer
+
+from data_loader import sft_dataloader
+from datasets import Dataset, DatasetDict
+
+"""
+Unused imports:
 import torch.nn as nn
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_int8_training
-from transformers import (
-    AutoConfig,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    HfArgumentParser,
-    PreTrainedTokenizerBase,
-    Trainer,
-    TrainingArguments,
-)
-from transformers.utils import PaddingStrategy
-from transformers import LlamaForCausalLM, LlamaTokenizer, LlamaForSequenceClassification, LlamaConfig
+import bitsandbytes as bnb
+"""
 
-from data_loader import rm_dataloader
-
-DEFAULT_PAD_TOKEN = "[PAD]"
-DEFAULT_EOS_TOKEN = "</s>"
-DEFAULT_BOS_TOKEN = "</s>"
-DEFAULT_UNK_TOKEN = "</s>"
-
-
-# Define and parse arguments.
-@dataclass
-class ScriptArguments:
-    """
-    These arguments vary depending on how many GPUs you have, what their capacity and features are, and what size model you want to train.
-    """
-
-    local_rank: Optional[int] = field(
-        default=-1, metadata={"help": "Used for multi-gpu"})
-    resume_from_checkpoint: Optional[bool] = field(
-        default=False,
-        metadata={"help": "If you want to resume training where it left off."},
-    )
-    deepspeed: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Path to deepspeed config if using deepspeed. You may need this if the model that you want to train doesn't fit on a single GPU."
-        },
-    )
-    per_device_train_batch_size: Optional[int] = field(default=4)
-    per_device_eval_batch_size: Optional[int] = field(default=1)
-    gradient_accumulation_steps: Optional[int] = field(default=1)
-    learning_rate: Optional[float] = field(default=2e-5)
-    weight_decay: Optional[int] = field(default=0.001)
-    model_name: Optional[str] = field(
-        default="gpt2",
-        metadata={
-            "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
-        },
-    )
-    bf16: Optional[bool] = field(
-        default=True,
-        metadata={
-            "help": "This essentially cuts the training time in half if you want to sacrifice a little precision and have a supported GPU."
-        },
-    )
-    num_train_epochs: Optional[int] = field(
-        default=1,
-        metadata={"help": "The number of training epochs for the reward model."},
-    )
-    train_subset: Optional[int] = field(
-        default=100000,
-        metadata={"help": "The size of the subset of the training data to use"},
-    )
-    eval_subset: Optional[int] = field(
-        default=50000,
-        metadata={"help": "The size of the subset of the eval data to use"},
-    )
-    gradient_checkpointing: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables gradient checkpointing."},
-    )
-    optim: Optional[str] = field(
-        default="adamw_hf",
-        metadata={"help": "Enables gradient checkpointing."},
-    )
-    lr_scheduler_type: Optional[str] = field(
-        default="linear",
-        metadata={"help": "The lr scheduler"},
-    )
-
-
-parser = HfArgumentParser(ScriptArguments)
-script_args = parser.parse_args_into_dataclasses()[0]
-
-
-dataset_name = "./datasets/"
-print("dataset_name: ", dataset_name)
-
-# Define the training args. Needs to be done before the model is loaded if you are using deepspeed.
-model_name_split = script_args.model_name.split("/")[-1]
-print("model_name_split: ", model_name_split)
-# output_name = (
-# f"{model_name_split}_peft_stack-exchange-paired_rmts__{script_args.train_subset}_{script_args.learning_rate}"
-# )
-output_name = (
-    f"reward_model_{model_name_split}_{script_args.train_subset}_{script_args.learning_rate}"
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    get_peft_model_state_dict,
+    prepare_model_for_int8_training,
+    set_peft_model_state_dict,
 )
 
+def read_jsonl(file_path):
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            data.append(json.loads(line))
+    return data
+
+# Read the JSONL files
 
 
-training_args = TrainingArguments(
-    output_dir=output_name,
-    learning_rate=script_args.learning_rate,
-    per_device_train_batch_size=script_args.per_device_train_batch_size,
-    per_device_eval_batch_size=script_args.per_device_eval_batch_size,
-    num_train_epochs=script_args.num_train_epochs,
-    weight_decay=script_args.weight_decay,
-    evaluation_strategy="steps",
-    eval_steps=200,  # 500,
-    save_strategy="steps",
-    save_steps=200,  # 500,
-    save_total_limit=2,
-    gradient_accumulation_steps=script_args.gradient_accumulation_steps,
-    gradient_checkpointing=script_args.gradient_checkpointing,
-    deepspeed=script_args.deepspeed,
-    # local_rank=script_args.local_rank,
-    remove_unused_columns=False,
-    label_names=[],
-    # bf16=script_args.bf16,
-    # fp16=True, #! this is important! if True, cuda out of memory.
-    logging_strategy="steps",
-    logging_steps=10,
-    optim=script_args.optim,
-    lr_scheduler_type=script_args.lr_scheduler_type,
-)
 
-# Load the value-head model and tokenizer.
-if "llama" in script_args.model_name:
-    tokenizer = LlamaTokenizer.from_pretrained(script_args.model_name)
-    config = LlamaConfig.from_pretrained(script_args.model_name)
-else:
-    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(script_args.model_name, trust_remote_code=True)
+def convert_to_dataset_format(data):
+    dataset_dict = {}
+    # Initialize the dictionary with empty lists for each key
+    for key in data[0].keys():
+        dataset_dict[key] = []
+    # Aggregate the values for each key
+    for item in data:
+        for key, value in item.items():
+            dataset_dict[key].append(value)
+    return dataset_dict
 
-if "llama" in script_args.model_name:
-    # required for llama
-    tokenizer.add_special_tokens(
-        {
-            "eos_token": DEFAULT_EOS_TOKEN,
-            "bos_token": DEFAULT_BOS_TOKEN,
-            "unk_token": DEFAULT_UNK_TOKEN,
-            "pad_token": DEFAULT_PAD_TOKEN,
-        }
+
+
+def train(
+    # model/data params
+    base_model: str = "kfkas/Llama-2-ko-7b-Chat",  # the only required argument
+    data_path: str = "datasets",
+    output_dir: str = '/home/workspace/hdd/alphaca/supervised-finetuning",
+    # training hyperparams
+    batch_size: int = 256,
+    micro_batch_size: int = 4,
+    num_epochs: int = 3,
+    learning_rate: float = 3e-4,
+    cutoff_len: int = 256,
+    val_set_size: int = 2000,
+    # lora hyperparams
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    lora_target_modules: List[str] = [
+        "q_proj",
+        "v_proj",
+    ],
+    # llm hyperparams
+    train_on_inputs: bool = True,  # if False, masks out inputs in loss
+    add_eos_token: bool = False,
+    group_by_length: bool = False,  # faster, but produces an odd training loss curve
+    # wandb params
+    wandb_project: str = "LLM",
+    wandb_run_name: str = "Supervised_Finetuning",
+    wandb_watch: str = "",  # options: false | gradients | all
+    wandb_log_model: str = "",  # options: false | true
+    # either training checkpoint or final adapter
+    resume_from_checkpoint: str = None,
+    # The prompt template to use, will default to alpaca.
+    prompt_template_name: str = "alpaca",
+):
+    train_data = read_jsonl('datasets/train_sft.jsonl')
+    valid_data = read_jsonl('datasets/validate_sft.jsonl')
+
+    train_dataset_dict = convert_to_dataset_format(train_data)
+    valid_dataset_dict = convert_to_dataset_format(valid_data)
+
+
+    train_dataset = Dataset.from_dict(train_dataset_dict)
+
+    valid_dataset = Dataset.from_dict(valid_dataset_dict)
+
+    combined_dataset = DatasetDict({
+        'train': train_dataset,
+        'test': valid_dataset
+    })
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(
+            f"Training Alpaca-LoRA model with params:\n"
+            f"base_model: {base_model}\n"
+            f"data_path: {data_path}\n"
+            f"output_dir: {output_dir}\n"
+            f"batch_size: {batch_size}\n"
+            f"micro_batch_size: {micro_batch_size}\n"
+            f"num_epochs: {num_epochs}\n"
+            f"learning_rate: {learning_rate}\n"
+            f"cutoff_len: {cutoff_len}\n"
+            f"val_set_size: {val_set_size}\n"
+            f"lora_r: {lora_r}\n"
+            f"lora_alpha: {lora_alpha}\n"
+            f"lora_dropout: {lora_dropout}\n"
+            f"lora_target_modules: {lora_target_modules}\n"
+            f"train_on_inputs: {train_on_inputs}\n"
+            f"group_by_length: {group_by_length}\n"
+            f"wandb_project: {wandb_project}\n"
+            f"wandb_run_name: {wandb_run_name}\n"
+            f"wandb_watch: {wandb_watch}\n"
+            f"wandb_log_model: {wandb_log_model}\n"
+            f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
+            f"prompt template: {prompt_template_name}\n"
+        )
+    assert (
+        base_model
+    ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+    gradient_accumulation_steps = batch_size // micro_batch_size
+
+    device_map = "auto"
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddp = world_size != 1
+    if ddp:
+        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+
+    # Check if parameter passed or if set within environ
+    use_wandb = len(wandb_project) > 0 or (
+        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
     )
-else:
-    # required for gpt2
-    tokenizer.pad_token = tokenizer.eos_token
+    # Only overwrite environ if wandb param passed
+    if len(wandb_project) > 0:
+        os.environ["WANDB_PROJECT"] = wandb_project
+    if len(wandb_watch) > 0:
+        os.environ["WANDB_WATCH"] = wandb_watch
+    if len(wandb_log_model) > 0:
+        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-
-device_map = "auto"
-world_size = int(os.environ.get("WORLD_SIZE", 1))
-ddp = world_size != 1
-if ddp:
-    device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-print("device_map: ", device_map)
-# model = AutoModelForSequenceClassification.from_pretrained(
-#    script_args.model_name, num_labels=1, torch_dtype=torch.bfloat16
-# )
-
-if "llama" in script_args.model_name:
-    model = LlamaForSequenceClassification.from_pretrained(
-        script_args.model_name,
-        num_labels=1,
+    model = LlamaForCausalLM.from_pretrained(
+        base_model,
         load_in_8bit=True,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
-else:
-    model = AutoModelForSequenceClassification.from_pretrained(
-        script_args.model_name,
-        num_labels=1,
-        load_in_8bit=True,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-        trust_remote_code=True,
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+
+    tokenizer.pad_token_id = (
+        0  # unk. we want this to be different from the eos token
+    )
+    tokenizer.padding_side = "left"  # Allow batched inference
+
+    model = prepare_model_for_int8_training(model)
+
+    config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
+
+    if resume_from_checkpoint:
+        # Check the available weights and load them
+        checkpoint_name = os.path.join(
+            resume_from_checkpoint, "pytorch_model.bin"
+        )  # Full checkpoint
+        if not os.path.exists(checkpoint_name):
+            checkpoint_name = os.path.join(
+                resume_from_checkpoint, "adapter_model.bin"
+            )  # only LoRA model - LoRA config above has to fit
+            resume_from_checkpoint = (
+                False  # So the trainer won't try loading its state
+            )
+        # The two files above have a different name depending on how they were saved, but are actually the same.
+        if os.path.exists(checkpoint_name):
+            print(f"Restarting from {checkpoint_name}")
+            adapters_weights = torch.load(checkpoint_name)
+            # print(f"adapters_weights: ", type(adapters_weights), adapters_weights.keys())
+            # model = set_peft_model_state_dict(model, adapters_weights)
+            set_peft_model_state_dict(model, adapters_weights)
+            print(f"model: ", type(model))
+        else:
+            print(f"Checkpoint {checkpoint_name} not found")
+
+    # Be more transparent about the % of trainable params.
+    model.print_trainable_parameters()
+
+    data_loader = sft_dataloader.CustomDataLoader(
+        combined_dataset, cutoff_len, val_set_size, train_on_inputs, add_eos_token, prompt_template_name, tokenizer)
+    train_data, val_data = data_loader.load_data()
+
+    if not ddp and torch.cuda.device_count() > 1:
+        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
+        model.is_parallelizable = True
+        model.model_parallel = True
+
+    trainer = transformers.Trainer(
+        model=model,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        args=transformers.TrainingArguments(
+            per_device_train_batch_size=micro_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            warmup_steps=100,
+            num_train_epochs=num_epochs,
+            learning_rate=learning_rate,
+            fp16=True,
+            logging_steps=10,
+            optim="adamw_torch",
+            evaluation_strategy="steps" if val_set_size > 0 else "no",
+            save_strategy="steps",
+            eval_steps=200 if val_set_size > 0 else None,
+            save_steps=200,
+            output_dir=output_dir,
+            save_total_limit=3,
+            load_best_model_at_end=True if val_set_size > 0 else False,
+            ddp_find_unused_parameters=False if ddp else None,
+            group_by_length=group_by_length,
+            report_to="wandb" if use_wandb else None,
+            run_name=wandb_run_name if use_wandb else None,
+        ),
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+    )
+    model.config.use_cache = False
+
+    old_state_dict = model.state_dict
+    print("old_state_dict: ", old_state_dict())
+    model.state_dict = (
+        lambda self, *_, **__: get_peft_model_state_dict(
+            self, old_state_dict()
+        )
+    ).__get__(model, type(model))
+    print("model.state_dict: ", model.state_dict)
+
+    if torch.__version__ >= "2" and sys.platform != "win32":
+        model = torch.compile(model)
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    model.save_pretrained(output_dir)
+
+    print(
+        "\n If there's a warning about missing keys above, please disregard :)"
     )
 
-model = prepare_model_for_int8_training(model)
 
-peft_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,
-    inference_mode=False,
-    r=8,
-    lora_alpha=16,  # 32,
-    lora_dropout=0.05,  # 0.1,
-    bias="none",
-)
+if __name__ == "__main__":
 
-model = get_peft_model(model, peft_config)
-
-model.print_trainable_parameters()
-
-# Need to do this for gpt2, because it doesn't have an official pad token.
-tokenizer.pad_token = tokenizer.eos_token
-model.config.pad_token_id = tokenizer.eos_token_id
-model.config.use_cache = not script_args.gradient_checkpointing
-num_proc = 24  # Can adjust to be higher if you have more processors.
-
-
-
-reward_dataloder = rm_dataloader.RewardDataLoader(dataset_name, script_args.train_subset, script_args.eval_subset, num_proc, tokenizer)
-train_dataset, eval_dataset = reward_dataloder.load_data()
-
-# We need to define a special data collator that batches the data in our j vs k format.
-@dataclass
-class RewardDataCollatorWithPadding:
-    tokenizer: PreTrainedTokenizerBase
-    padding: Union[bool, str, PaddingStrategy] = True
-    max_length: Optional[int] = None
-    pad_to_multiple_of: Optional[int] = None
-    return_tensors: str = "pt"
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        features_j = []
-        features_k = []
-        for feature in features:
-            features_j.append(
-                {
-                    "input_ids": feature["input_ids_j"],
-                    "attention_mask": feature["attention_mask_j"],
-                }
-            )
-            features_k.append(
-                {
-                    "input_ids": feature["input_ids_k"],
-                    "attention_mask": feature["attention_mask_k"],
-                }
-            )
-        batch_j = self.tokenizer.pad(
-            features_j,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors=self.return_tensors,
-        )
-        batch_k = self.tokenizer.pad(
-            features_k,
-            padding=self.padding,
-            max_length=self.max_length,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors=self.return_tensors,
-        )
-        batch = {
-            "input_ids_j": batch_j["input_ids"],
-            "attention_mask_j": batch_j["attention_mask"],
-            "input_ids_k": batch_k["input_ids"],
-            "attention_mask_k": batch_k["attention_mask"],
-            "return_loss": True,
-        }
-        return batch
-
-
-# Define the metric that we'll use for validation.
-accuracy = evaluate.load("accuracy")
-
-
-def compute_metrics(eval_pred):
-    predictions, _ = eval_pred
-    # Here, predictions is rewards_j and rewards_k.
-    # We want to see how much of the time rewards_j > rewards_k.
-    predictions = np.argmax(predictions, axis=0)
-    labels = np.zeros(predictions.shape)
-    return accuracy.compute(predictions=predictions, references=labels)
-
-
-class RewardTrainer(Trainer):
-    # Define how to compute the reward loss. We use the InstructGPT pairwise logloss: https://arxiv.org/abs/2203.02155
-    def compute_loss(self, model, inputs, return_outputs=False):
-        rewards_j = model(
-            input_ids=inputs["input_ids_j"], attention_mask=inputs["attention_mask_j"])[0]
-        rewards_k = model(
-            input_ids=inputs["input_ids_k"], attention_mask=inputs["attention_mask_k"])[0]
-        loss = -nn.functional.logsigmoid(rewards_j - rewards_k).mean()
-        if return_outputs:
-            return loss, {"rewards_j": rewards_j, "rewards_k": rewards_k}
-        return loss
-
-
-# Train the model, woohoo.
-trainer = RewardTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    compute_metrics=compute_metrics,
-    data_collator=RewardDataCollatorWithPadding(
-        tokenizer=tokenizer, max_length=512, pad_to_multiple_of=8),
-)
-
-model.config.use_cache = False
-
-trainer.train(script_args.resume_from_checkpoint)
-
-print("Saving last checkpoint of the model")
-# model.save_pretrained(output_name + "_peft_last_checkpoint")
-model.save_pretrained(output_name)
+    fire.Fire(train)
